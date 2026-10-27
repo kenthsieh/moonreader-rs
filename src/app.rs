@@ -166,6 +166,14 @@ fn spawn_search(
     Job::Search { gen, rx }
 }
 
+/// 字元 offset → 位元組 offset(超出則回傳全文長度)。
+fn byte_of_char(text: &str, char_offset: usize) -> usize {
+    text.char_indices()
+        .nth(char_offset)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len())
+}
+
 /// 二分:位元組 offset → 段落 index(offs 單調遞增;對應 blockIndexForOffset)。
 fn block_index_for_offset(offs: &[usize], offset: usize) -> usize {
     if offs.is_empty() {
@@ -307,6 +315,10 @@ struct EditorState {
     search_truncated: bool,
     leave_dialog: bool,
     jump_input: String,
+    /// 編輯視口頂端在目前頁的字元 index(返回閱讀頁時對齊用)。
+    view_top_char: usize,
+    /// 下一次程式化定位把目標捲到視口頂端(開檔/切頁);否則置中(搜尋/undo)。
+    focus_to_top: bool,
 }
 
 impl EditorState {
@@ -335,6 +347,8 @@ impl EditorState {
             search_truncated: false,
             leave_dialog: false,
             jump_input: String::new(),
+            view_top_char: 0,
+            focus_to_top: false,
         }
     }
 }
@@ -359,6 +373,8 @@ pub struct MoonReader {
     font_state: u8,
     toast: Option<(String, f64)>,
     pending_editor_offset: Option<usize>,
+    /// 從編輯器返回時,閱讀頁要對齊的全文字元 offset。
+    pending_reader_offset: Option<usize>,
     exit_to_reader: bool,
     cli_file: Option<PathBuf>,
     /// 使用者關窗時有未存檔變更:先問,處理完再關。
@@ -410,6 +426,7 @@ impl MoonReader {
             font_state: 0,
             toast: None,
             pending_editor_offset: None,
+            pending_reader_offset: None,
             exit_to_reader: false,
             cli_file: std::env::args().nth(1).map(PathBuf::from).filter(|p| p.is_file()),
             quit_pending: false,
@@ -517,6 +534,8 @@ impl MoonReader {
             ed.dirty = false;
             ed.conflict = false;
             ed.focus_pending = Some((cur, cur));
+            ed.focus_to_top = true;
+            ed.view_top_char = cur;
             ed.commit_deadline = None;
             ed.history.reset();
             ed.search_open = false;
@@ -553,6 +572,11 @@ impl MoonReader {
             book.content_hash = d.content_hash;
             book.last_modified_at = d.last_modified_at;
             book.last_opened_at = now_millis();
+            // 從編輯器返回:以編輯視口頂端的位置為準(而非進編輯器前的閱讀位置)。
+            if let Some(off) = self.pending_reader_offset.take() {
+                let byte = byte_of_char(&d.text, off);
+                book.scroll_index = block_index_for_offset(&with_offsets.offsets, byte);
+            }
             self.library.upsert(book.clone());
             self.library.save();
 
@@ -643,7 +667,20 @@ impl MoonReader {
         }
     }
 
+    /// 編輯視口頂端在全文中的字元 offset。
+    fn editor_view_offset(&self) -> usize {
+        let ed = &self.editor;
+        let before: usize = ed.pages[..ed.page.min(ed.pages.len())]
+            .iter()
+            .map(|p| p.chars().count())
+            .sum();
+        before + ed.view_top_char
+    }
+
     fn exit_editor_to_reader(&mut self, ctx: &egui::Context) {
+        if !self.editor.loading && self.editor.error.is_none() {
+            self.pending_reader_offset = Some(self.editor_view_offset());
+        }
         let p = self.editor.path.clone();
         let rect = self.reader.content_rect;
         self.route = Route::Reading;
@@ -1682,9 +1719,15 @@ impl MoonReader {
 
             let id = ui.id().with("editor_text");
             // 程式化游標定位:show 前寫入 state(對應 cursorFocusToken)。
-            if let Some((s, e)) = self.editor.focus_pending.take() {
+            let jump = self.editor.focus_pending.take();
+            if let Some((s, e)) = jump {
                 set_cursor(ui.ctx(), id, Some((s, e)));
             }
+            let jump_align = if std::mem::take(&mut self.editor.focus_to_top) {
+                Align::Min
+            } else {
+                Align::Center
+            };
 
             let mut layouter = |ui: &Ui, text: &str, wrap_width: f32| {
                 let mut job = LayoutJob::simple(
@@ -1709,13 +1752,41 @@ impl MoonReader {
                 ui.fonts(|f| f.layout_job(job))
             };
 
-            let out = TextEdit::multiline(&mut self.editor.buffer)
-                .id(id)
-                .font(editor_font.clone())
-                .margin(6.0)
-                .desired_width(f32::INFINITY)
-                .layouter(&mut layouter)
-                .show(ui);
+            // 編輯頁必須包在 ScrollArea 內:否則 6 萬字的頁只看得到第一屏,
+            // 程式化游標定位(從閱讀頁帶入的位置、搜尋命中、undo)也無從捲過去。
+            let buffer = &mut self.editor.buffer;
+            let mut top_char = self.editor.view_top_char;
+            let sa = ScrollArea::vertical()
+                .id_salt("editor_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let out = TextEdit::multiline(buffer)
+                        .id(id)
+                        .font(editor_font.clone())
+                        .margin(6.0)
+                        .desired_width(f32::INFINITY)
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    if let Some((s, _)) = jump {
+                        let r = out
+                            .galley
+                            .pos_from_ccursor(CCursor::new(s))
+                            .translate(out.galley_pos.to_vec2());
+                        ui.scroll_to_rect(r, Some(jump_align));
+                        out.response.request_focus();
+                    }
+                    // 視口頂端對應的字元(返回閱讀頁時,以此段落為第一個可見段)。
+                    let local_y = (ui.clip_rect().top() - out.galley_pos.y).max(0.0);
+                    top_char = out.galley.cursor_from_pos(vec2(0.0, local_y)).ccursor.index;
+                    out
+                });
+            let out = sa.inner;
+            self.editor.view_top_char = if jump.is_some() {
+                // 本幀捲動尚未生效:以跳轉目標為準。
+                jump.map(|(s, _)| s).unwrap_or(top_char)
+            } else {
+                top_char
+            };
 
             if let Some(cr) = out.cursor_range {
                 let n = self.editor.buffer.chars().count();
@@ -1797,7 +1868,8 @@ impl MoonReader {
                 self.editor.conflict = false;
                 self.quit_pending = false;
                 let p = self.editor.path.clone();
-                self.open_editor(ctx, &p, 0);
+                let off = self.editor_view_offset();
+                self.open_editor(ctx, &p, off);
             } else if acts.conflict_cancel {
                 self.editor.conflict = false;
                 self.quit_pending = false;
@@ -1942,6 +2014,7 @@ impl MoonReader {
         self.editor.buffer = self.editor.pages[target].clone();
         self.editor.last_buffer = self.editor.buffer.clone();
         self.editor.focus_pending = Some((0, 0));
+        self.editor.focus_to_top = true;
     }
 
     fn editor_undo(&mut self) {
@@ -2428,6 +2501,37 @@ mod tests {
         assert_eq!(block_at(&tops, 10.0), 1);
         assert_eq!(block_at(&tops, 59.0), 2);
         assert_eq!(block_at(&tops, 1000.0), 3); // 超出 → 呼叫端夾住
+    }
+
+    #[test]
+    fn reader_editor_offsets_roundtrip_to_same_block() {
+        // 閱讀 → 編輯:段落 byte offset → 字元 offset → (頁, 頁內游標);
+        // 編輯 → 閱讀:(頁, 頁內字元) → 全文字元 offset → 段落。兩邊須落在同一段。
+        let text: String = (0..3000)
+            .map(|i| format!("　　第{i}段,中文內容 abc。\r\n\r\n"))
+            .collect();
+        let chunks = TextChunker::blocks(&text);
+        let pages = page_splitter::split(&text, 5_000);
+        assert!(pages.len() > 3);
+        for &block in &[0usize, 1, 777, 1500, 2999] {
+            let char_off = search::byte_to_char(&text, chunks.offsets[block]);
+            let (pg, cur) = page_splitter::locate(&pages, char_off);
+            let back: usize = pages[..pg].iter().map(|p| p.chars().count()).sum::<usize>() + cur;
+            assert_eq!(back, char_off);
+            let b = block_index_for_offset(&chunks.offsets, byte_of_char(&text, back));
+            assert_eq!(b, block, "block {block}");
+            // 編輯頁內游標所在處的文字 = 該段開頭。
+            let page_text: String = pages[pg].chars().skip(cur).take(4).collect();
+            assert!(chunks.blocks[block].text.starts_with(&page_text), "{page_text:?}");
+        }
+    }
+
+    #[test]
+    fn byte_of_char_handles_multibyte_and_overflow() {
+        assert_eq!(byte_of_char("中a文", 0), 0);
+        assert_eq!(byte_of_char("中a文", 1), 3);
+        assert_eq!(byte_of_char("中a文", 2), 4);
+        assert_eq!(byte_of_char("中a文", 99), 7);
     }
 
     #[test]
