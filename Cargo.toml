@@ -1,0 +1,25 @@
+[package]
+name = "moonreader-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust 版月讀(由 Android Compose app 改寫):純文字(ebook/TXT)閱讀器 + 分頁編輯器"
+
+[dependencies]
+eframe = { version = "=0.29.1", default-features = false, features = [
+    "glow",
+    "x11",
+    "wayland",
+    "default_fonts",
+] }
+egui = "=0.29.1"
+encoding_rs = "0.8.42"
+sha2 = "0.11.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rfd = "0.17"
+directories = "6.0"
+regex = "1.13"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 2
